@@ -232,7 +232,7 @@
 
 // ---------- CONFIG ----------
 // Paste your deployed Google Apps Script Web App URL here after setup.
-const API_BASE_URL = 'https://script.google.com/macros/s/AKfycbxx53FOnrzZ4N1dBhXNW4YS8C1G-X9mlyNnPOxzNYHpzt5OADl6J2fvKxO8ex6nD34u/exec';
+const API_BASE_URL = 'PASTE_YOUR_APPS_SCRIPT_WEB_APP_URL_HERE';
 
 const RECORDING_CHUNK_SECONDS = 30;   // how often a video chunk is finalized and uploaded
 const ANSWER_SYNC_INTERVAL_MS = 20000; // batch-sync answers to backend every 20s
@@ -891,6 +891,10 @@ function attachCandidateHomeHandlers() {
     if (!examId) return;
     const result = await apiGet('getExamForCandidate', { examId, candidateId: state.user.userId });
     if (!result.success) { msg('startExamMsg', result.error || 'Exam not found.', true); return; }
+    if (!result.questions || result.questions.length === 0) {
+      msg('startExamMsg', 'This exam has no questions yet. Contact your exam administrator — questions may not have been added, or may have been added under a different exam ID.', true);
+      return;
+    }
     state.exam = result.exam;
     state.questions = result.questions;
     state.answers = {};
@@ -965,6 +969,9 @@ function beginExam() {
 }
 
 function renderExam() {
+  if (!state.questions || state.questions.length === 0) {
+    return `<div class="card"><h2>No questions available</h2><div class="empty-state">This exam currently has no questions loaded. Please contact your exam administrator.</div></div>`;
+  }
   const q = state.questions[state.currentQuestionIndex];
   const navButtons = state.questions.map((qq, i) => {
     const answered = state.answers[qq.questionId] !== undefined;
@@ -1045,6 +1052,7 @@ function renderQuestionBody(q) {
 }
 
 function attachExamHandlers() {
+  if (!state.questions || state.questions.length === 0) return;
   const q = state.questions[state.currentQuestionIndex];
 
   if (document.getElementById('camPreview') && state.mediaStream) {
