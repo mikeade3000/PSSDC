@@ -262,6 +262,8 @@ const state = {
   bootstrapMode: false,
   bulkUserRows: [],
   bulkQuestionRows: [],
+  serverRemainingSec: null,
+  isResumedSession: false,
   timeRemainingSec: 0,
   timerHandle: null,
   syncHandle: null,
@@ -549,6 +551,17 @@ function renderAdmin() {
       <button class="btn btn-outline" id="assignBtn" style="margin-top:16px;">Assign</button>
       <div id="assignMsg"></div>
     </div>
+
+    <div class="card">
+      <h2>Reallocate exam attempt</h2>
+      <div class="sub">Once a candidate submits an exam, they cannot retake it. Use this to clear a completed attempt and allow them to sit the exam again.</div>
+      <label>Exam ID</label>
+      <input type="text" id="resetExamId" />
+      <label>Candidate user ID</label>
+      <input type="text" id="resetCandidateId" placeholder="Paste candidate's userId" />
+      <button class="btn btn-outline" id="resetAttemptBtn" style="margin-top:16px;">Allow retake</button>
+      <div id="resetAttemptMsg"></div>
+    </div>
   `;
 }
 
@@ -595,6 +608,13 @@ function attachAdminHandlers() {
     if (!examId || !candidateId) { msg('assignMsg', 'Both fields are required.', true); return; }
     const r = await apiPost('assignCandidate', { examId, candidateId });
     msg('assignMsg', r.success ? 'Candidate assigned.' : r.error, !r.success);
+  };
+
+  document.getElementById('resetAttemptBtn').onclick = async () => {
+    const examId = val('resetExamId'), candidateId = val('resetCandidateId');
+    if (!examId || !candidateId) { msg('resetAttemptMsg', 'Both fields are required.', true); return; }
+    const r = await apiPost('resetCandidateAttempt', { examId, candidateId });
+    msg('resetAttemptMsg', r.success ? r.message : r.error, !r.success);
   };
 
   // ---- Bulk user upload ----
@@ -899,6 +919,8 @@ function attachCandidateHomeHandlers() {
     state.questions = result.questions;
     state.answers = {};
     state.currentQuestionIndex = 0;
+    state.serverRemainingSec = result.remainingSec;
+    state.isResumedSession = !!result.resumed;
 
     const saved = localLoadAnswers();
     if (saved) { state.answers = saved.answers || {}; }
@@ -954,11 +976,15 @@ async function enterFullscreen() {
 
 // ---------- EXAM FLOW ----------
 function beginExam() {
-  state.timeRemainingSec = Number(state.exam.durationMinutes) * 60;
+  state.timeRemainingSec = state.serverRemainingSec !== null && state.serverRemainingSec !== undefined
+    ? state.serverRemainingSec
+    : Number(state.exam.durationMinutes) * 60;
   state.violationCount = 0;
   state.examSubmitted = false;
   state.currentView = 'exam';
   render();
+
+  if (state.isResumedSession) showViolationToast('Resuming your exam with your remaining time — the clock did not reset.');
 
   apiPost('startSession', { examId: state.exam.examId, candidateId: state.user.userId });
   startRecording();
@@ -1301,6 +1327,8 @@ async function submitExam() {
 
   stopRecording();
   if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+
+  localStorage.removeItem(LOCAL_KEY_PREFIX + state.exam.examId + '_' + state.user.userId);
 
   state.currentView = 'examSubmitted';
   render();
