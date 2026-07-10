@@ -1210,8 +1210,21 @@ async function syncAnswersToServer() {
   const answers = Object.entries(state.answers).map(([questionId, answer]) => ({ questionId, answer }));
   if (!answers.length) return;
   try {
-    await apiPost('submitAnswers', { examId: state.exam.examId, candidateId: state.user.userId, answers });
+    const result = await apiPost('submitAnswers', { examId: state.exam.examId, candidateId: state.user.userId, answers });
+    if (result && result.alreadySubmitted) forceCloseAlreadySubmitted();
   } catch (e) { /* will retry on next interval; local copy remains source of truth */ }
+}
+
+function forceCloseAlreadySubmitted() {
+  if (state.examSubmitted) return;
+  state.examSubmitted = true;
+  stopAllTimers();
+  detachProctoringListeners();
+  stopRecording();
+  if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {});
+  alert('This exam session is already marked as submitted (it may have been finalized from another tab or after a disconnection). You cannot continue.');
+  state.currentView = 'examSubmitted';
+  render();
 }
 
 function startHeartbeat() {
