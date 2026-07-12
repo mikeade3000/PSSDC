@@ -227,16 +227,24 @@
    LAGOS STATE SCHOLARSHIP BOARD — CBT PLATFORM
    Frontend application logic
    Developed by MIFANET RESOURCES for the Lagos State
-   Examination Board. Copyright (c) 2026.
+   Scholarship Board. Copyright (c) 2026.
    ============================================================ */
 
 // ---------- CONFIG ----------
 // Paste your deployed Google Apps Script Web App URL here after setup.
 const API_BASE_URL = 'https://script.google.com/macros/s/AKfycbxx53FOnrzZ4N1dBhXNW4YS8C1G-X9mlyNnPOxzNYHpzt5OADl6J2fvKxO8ex6nD34u/exec';
 
-const RECORDING_CHUNK_SECONDS = 30;   // how often a video chunk is finalized and uploaded
+const RECORDING_CHUNK_SECONDS = 15;   // how often a video chunk is finalized and uploaded (kept short so each upload is small and survives weak connections)
 const ANSWER_SYNC_INTERVAL_MS = 20000; // batch-sync answers to backend every 20s
 const HEARTBEAT_INTERVAL_MS = 45000;
+// Candidate-conduct violations (tab switch, fullscreen exit, window blur) are
+// counted and logged so the examiner can weigh them when reviewing the sitting.
+// They carry NO automatic penalty for the candidate — recommended actions are
+// shown to the examiner in the monitoring view as a suggestion only, and every
+// decision (accept, review recording, invalidate, allow retake) belongs to the
+// examiner. Technical problems (e.g. recording upload failures) are logged
+// separately and never attributed to candidate conduct.
+const CONDUCT_VIOLATION_TYPES = ['tab_switch', 'fullscreen_exit', 'window_blur'];
 
 // Bootstrap admin credential — lets you into the Admin panel before the
 // Apps Script backend is deployed or before setupSheetsAndFolders has been
@@ -287,13 +295,20 @@ async function apiGet(action, params) {
   return res.json();
 }
 
-async function apiPost(action, payload) {
-  const res = await fetch(API_BASE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight against Apps Script
-    body: JSON.stringify({ action, payload })
-  });
-  return res.json();
+async function apiPost(action, payload, timeoutMs) {
+  const controller = timeoutMs ? new AbortController() : null;
+  const timeoutHandle = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const res = await fetch(API_BASE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // avoids CORS preflight against Apps Script
+      body: JSON.stringify({ action, payload }),
+      signal: controller ? controller.signal : undefined
+    });
+    return res.json();
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 // ---------- LOCAL PERSISTENCE (local-first answers) ----------
@@ -500,7 +515,7 @@ function renderAdmin() {
       <label>Options (one per line — for MCQ/drag-drop items/matching left column)</label>
       <textarea id="qOptions" placeholder="Option A&#10;Option B&#10;Option C"></textarea>
       <label>Correct answer</label>
-      <input type="text" id="qCorrect" placeholder="For MCQ: exact option text. For ordering: comma-separated correct order. For matching: JSON pairs." />
+      <input type="text" id="qCorrect" placeholder="MCQ/True-False: exact option text. Drag-drop: comma-separated order. Matching: left=right pairs separated by semicolons." />
       <label>Points</label>
       <input type="number" id="qPoints" value="1" />
       <button class="btn" id="addQuestionBtn" style="margin-top:16px;">Add question</button>
@@ -595,8 +610,16 @@ function attachAdminHandlers() {
     if (!examId || !prompt) { msg('addQuestionMsg', 'Exam ID and prompt are required.', true); return; }
 
     let correctAnswer = correctRaw;
-    if (type === 'dragdrop') correctAnswer = correctRaw.split(',').map(s => s.trim());
-    if (type === 'matching') { try { correctAnswer = JSON.parse(correctRaw); } catch (e) { /* leave as string */ } }
+    if (type === 'dragdrop') correctAnswer = correctRaw.split(',').map(s => s.trim()).filter(Boolean);
+    if (type === 'matching') {
+      const pairs = {};
+      correctRaw.split(';').filter(Boolean).forEach(pairStr => {
+        const eq = pairStr.indexOf('=');
+        if (eq > -1) pairs[pairStr.slice(0, eq).trim()] = pairStr.slice(eq + 1).trim();
+      });
+      correctAnswer = pairs;
+      if (!Object.keys(pairs).length) { msg('addQuestionMsg', 'Matching correctAnswer must use left=right pairs separated by semicolons.', true); return; }
+    }
 
     const r = await apiPost('addQuestion', {
       examId, type, prompt, options: optionsRaw, correctAnswer, points,
@@ -850,7 +873,7 @@ function renderExaminer() {
   return `
     <div class="card">
       <h2>Monitor exam</h2>
-      <div class="sub">Enter an exam ID to view live results and proctoring violations.</div>
+      <div class="sub">Enter an exam ID to view every exam taker's status, score, and proctoring record — with a suggested action for each. All suggestions are advisory only; the decision on any sitting rests with you as the examiner.</div>
       <label>Exam ID</label>
       <input type="text" id="monitorExamId" />
       <button class="btn" id="loadMonitorBtn" style="margin-top:14px;">Load</button>
@@ -859,30 +882,61 @@ function renderExaminer() {
   `;
 }
 
+// Advisory tiers only — surfaced to help the examiner triage, never enforced
+// by the system. The examiner decides the actual outcome for every sitting.
+function recommendedAction(conductCount) {
+  if (conductCount === 0) return { label: 'None', cls: 'badge-ok' };
+  if (conductCount <= 2) return { label: 'Note on record', cls: 'badge-ok' };
+  if (conductCount <= 5) return { label: 'Review recording before ratifying result', cls: 'badge-warn' };
+  return { label: 'Detailed review — consider invalidation or supervised retake', cls: 'badge-danger' };
+}
+
+function csvEscape(value) {
+  const s = String(value === undefined || value === null ? '' : value);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
 function attachExaminerHandlers() {
   document.getElementById('loadMonitorBtn').onclick = async () => {
     const examId = val('monitorExamId');
     if (!examId) return;
-    const [results, violations] = await Promise.all([
-      apiGet('getResults', { examId }),
+    const resultsBody = document.getElementById('monitorResults');
+    resultsBody.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
+
+    const [reportRes, violationsRes] = await Promise.all([
+      apiGet('getExamReport', { examId }),
       apiGet('getViolations', { examId })
     ]);
-    const resultsBody = document.getElementById('monitorResults');
-    let html = '<div class="card"><h2>Scores</h2>';
-    if (results.success && results.results.length) {
-      html += '<table><tr><th>Candidate</th><th>Score</th><th>Max</th><th>Answered</th></tr>';
-      results.results.forEach(r => {
-        html += `<tr><td>${r.candidateId}</td><td>${r.score}</td><td>${r.maxScore}</td><td>${r.answered}</td></tr>`;
+
+    let html = '<div class="card"><h2>Exam takers</h2>';
+    if (reportRes.success && reportRes.report && reportRes.report.length) {
+      html += `<div class="sub">"Suggested action" is advisory, based on the count of conduct flags — the decision on every sitting is yours. Technical issues (e.g. recording upload problems) are the platform's responsibility, not the candidate's, and carry no suggested action.</div>`;
+      html += '<button class="btn btn-gold btn-sm" id="downloadReportBtn" style="margin-bottom:14px;">Download all exam takers (CSV)</button>';
+      html += '<table><tr><th>Candidate</th><th>Status</th><th>Score</th><th>Answered</th><th>Conduct flags</th><th>Technical issues</th><th>Suggested action</th></tr>';
+      reportRes.report.forEach(r => {
+        const rec = recommendedAction(Number(r.conductViolations) || 0);
+        const name = r.fullName ? `${r.fullName} (${r.candidateId})` : r.candidateId;
+        html += `<tr>
+          <td>${escapeHtml(name)}</td>
+          <td><span class="badge ${r.status === 'submitted' ? 'badge-ok' : (r.status === 'in_progress' ? 'badge-warn' : 'badge-danger')}">${escapeHtml(r.status)}</span></td>
+          <td>${r.score} / ${r.maxScore}</td>
+          <td>${r.answered}</td>
+          <td>${r.conductViolations}</td>
+          <td>${r.technicalIssues}</td>
+          <td><span class="badge ${rec.cls}">${escapeHtml(rec.label)}</span></td>
+        </tr>`;
       });
       html += '</table>';
     } else {
-      html += '<div class="empty-state">No responses recorded yet.</div>';
+      html += '<div class="empty-state">No exam takers recorded for this exam yet.</div>';
     }
-    html += '</div><div class="card"><h2>Proctoring violations</h2>';
-    if (violations.success && violations.violations.length) {
+    html += '</div>';
+
+    html += '<div class="card"><h2>Violation log (detail)</h2>';
+    if (violationsRes.success && violationsRes.violations.length) {
       html += '<table><tr><th>Candidate</th><th>Type</th><th>Detail</th><th>Time</th></tr>';
-      violations.violations.forEach(v => {
-        html += `<tr><td>${v.candidateId}</td><td><span class="badge badge-warn">${v.type}</span></td><td>${v.detail || '—'}</td><td>${new Date(v.timestamp).toLocaleString()}</td></tr>`;
+      violationsRes.violations.forEach(v => {
+        html += `<tr><td>${escapeHtml(v.candidateId)}</td><td><span class="badge badge-warn">${escapeHtml(v.type)}</span></td><td>${escapeHtml(v.detail || '—')}</td><td>${new Date(v.timestamp).toLocaleString()}</td></tr>`;
       });
       html += '</table>';
     } else {
@@ -890,6 +944,22 @@ function attachExaminerHandlers() {
     }
     html += '</div>';
     resultsBody.innerHTML = html;
+
+    const dlBtn = document.getElementById('downloadReportBtn');
+    if (dlBtn) {
+      dlBtn.onclick = () => {
+        const header = ['candidateId', 'fullName', 'username', 'status', 'startedAt', 'score', 'maxScore', 'answered', 'conductViolations', 'technicalIssues', 'suggestedAction'];
+        const lines = [header.join(',')];
+        reportRes.report.forEach(r => {
+          const rec = recommendedAction(Number(r.conductViolations) || 0);
+          lines.push([
+            r.candidateId, r.fullName, r.username, r.status, r.startedAt,
+            r.score, r.maxScore, r.answered, r.conductViolations, r.technicalIssues, rec.label
+          ].map(csvEscape).join(','));
+        });
+        downloadCSV(`exam_report_${examId}.csv`, lines.join('\n'));
+      };
+    }
   };
 }
 
@@ -958,13 +1028,34 @@ function attachGateHandlers() {
     const errEl = document.getElementById('gateError');
     errEl.innerHTML = '';
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      // Resolution/frame-rate are deliberately capped: this keeps each recorded
+      // segment small enough to upload reliably over the variable connectivity
+      // candidates may have across Lagos State, without materially reducing
+      // proctoring usefulness (a small, low-frame-rate feed is still enough to
+      // verify identity and detect a second person in frame).
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640, max: 640 }, height: { ideal: 480, max: 480 }, frameRate: { ideal: 15, max: 15 } },
+        audio: true
+      });
       state.mediaStream = stream;
       stream.getTracks().forEach(track => {
         track.addEventListener('ended', () => {
           if (!state.examSubmitted) handleChunkUploadFailure(`${track.kind} track ended unexpectedly — device may have been disconnected or permission revoked.`);
         });
       });
+
+      // Preflight: record and upload a short test clip BEFORE the exam
+      // begins, so a broken recording/upload path is caught loudly now,
+      // not silently mid-exam.
+      errEl.innerHTML = '<div class="sub" style="color:#C7D6E3;">Testing your camera recording and upload… this takes a few seconds.</div>';
+      const preflight = await runRecordingPreflight();
+      if (!preflight.ok) {
+        state.mediaStream.getTracks().forEach(t => t.stop());
+        state.mediaStream = null;
+        errEl.innerHTML = `<div class="error-msg">Recording system check failed: ${preflight.reason}<br><br>Please notify your invigilator, check your internet connection, and press the button above to try again. The exam cannot begin until this check passes.</div>`;
+        return;
+      }
+
       await enterFullscreen();
       beginExam();
     } catch (e) {
@@ -1257,6 +1348,39 @@ function setRecordingHealth(status) {
   updateRecIndicatorDOM();
 }
 
+// Records ~2.5 seconds from the already-granted media stream and uploads it
+// through the exact same pipeline real exam chunks use. Returns {ok, reason}.
+// This proves camera capture, encoding, base64 transport, Apps Script, and
+// Drive write all work end-to-end before the exam is allowed to begin.
+async function runRecordingPreflight() {
+  try {
+    const mimeCandidates = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'];
+    const mimeType = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
+    const blob = await new Promise((resolve, reject) => {
+      const rec = new MediaRecorder(state.mediaStream, { mimeType, videoBitsPerSecond: 350000, audioBitsPerSecond: 64000 });
+      const parts = [];
+      rec.ondataavailable = e => { if (e.data && e.data.size > 0) parts.push(e.data); };
+      rec.onerror = () => reject(new Error('MediaRecorder failed during the test clip.'));
+      rec.onstop = () => resolve(new Blob(parts, { type: mimeType }));
+      rec.start();
+      setTimeout(() => { if (rec.state !== 'inactive') rec.stop(); }, 2500);
+    });
+    if (!blob || blob.size === 0) return { ok: false, reason: 'The test clip came back empty — your camera may be in use by another application.' };
+    const base64Data = await blobToBase64(blob);
+    const result = await apiPost('uploadRecordingChunk', {
+      examId: state.exam.examId, candidateId: state.user.userId,
+      chunkIndex: 0, mimeType, base64Data, isPreflight: true
+    }, 30000);
+    if (result && result.success) return { ok: true };
+    return { ok: false, reason: (result && result.error) || 'The server rejected the test upload.' };
+  } catch (e) {
+    const reason = e.name === 'AbortError'
+      ? 'The test upload timed out — your connection may be too slow or unstable right now.'
+      : e.message;
+    return { ok: false, reason };
+  }
+}
+
 function startRecording() {
   if (!state.mediaStream) return;
   state.chunkIndex = 0;
@@ -1265,9 +1389,18 @@ function startRecording() {
 
 function startNewRecorderSegment() {
   try {
-    const mimeCandidates = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+    // VP8 first: broader hardware compatibility and lower encoding overhead
+    // than VP9 across the varied device specs candidates may be using.
+    const mimeCandidates = ['video/webm;codecs=vp8,opus', 'video/webm;codecs=vp9,opus', 'video/webm', 'video/mp4'];
     const mimeType = mimeCandidates.find(m => MediaRecorder.isTypeSupported(m)) || 'video/webm';
-    const recorder = new MediaRecorder(state.mediaStream, { mimeType });
+    // Explicit bitrate cap keeps each ~30s segment to roughly 1.5-2MB
+    // regardless of device/browser encoder defaults, so uploads stay fast
+    // and reliable even on weaker connections.
+    const recorder = new MediaRecorder(state.mediaStream, {
+      mimeType,
+      videoBitsPerSecond: 350000,
+      audioBitsPerSecond: 64000
+    });
     const chunks = [];
 
     recorder.ondataavailable = e => { if (e.data && e.data.size > 0) chunks.push(e.data); };
@@ -1302,7 +1435,7 @@ async function uploadChunk(blob, mimeType, chunkIndex) {
     const result = await apiPost('uploadRecordingChunk', {
       examId: state.exam.examId, candidateId: state.user.userId,
       chunkIndex, mimeType, base64Data
-    });
+    }, 60000); // bounded timeout — a stalled upload shouldn't hang indefinitely
     if (result && result.success) {
       state.recordingFailCount = 0;
       setRecordingHealth('ok');
@@ -1310,7 +1443,8 @@ async function uploadChunk(blob, mimeType, chunkIndex) {
       handleChunkUploadFailure((result && result.error) || 'Backend rejected the recording chunk.');
     }
   } catch (e) {
-    handleChunkUploadFailure('Could not reach the server to upload the recording chunk: ' + e.message);
+    const detail = e.name === 'AbortError' ? 'Upload timed out after 60 seconds (slow or dropped connection).' : ('Could not reach the server to upload the recording chunk: ' + e.message);
+    handleChunkUploadFailure(detail);
   }
 }
 
@@ -1365,9 +1499,14 @@ function onWindowBlur() {
 }
 
 function recordViolation(type, detail) {
-  state.violationCount++;
   apiPost('logViolation', { examId: state.exam.examId, candidateId: state.user.userId, type, detail }).catch(() => {});
-  showViolationToast(detail);
+
+  if (CONDUCT_VIOLATION_TYPES.includes(type)) {
+    state.violationCount++;
+    showViolationToast(`${detail} This incident has been logged (conduct flag ${state.violationCount}) and will be available to the examiner reviewing this sitting.`);
+  } else {
+    showViolationToast(detail);
+  }
 }
 
 function showViolationToast(detail) {
