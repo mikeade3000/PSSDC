@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MIFANET RESOURCES — CBT Platform</title>
+<title>Lagos State Scholarship Board — CBT Platform</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -224,7 +224,7 @@
 
 <script>
 /* ============================================================
-   MIFANET RESOURCES — CBT PLATFORM
+   LAGOS STATE SCHOLARSHIP BOARD — CBT PLATFORM
    Frontend application logic
    Developed by MIFANET RESOURCES for the Lagos State
    Scholarship Board. Copyright (c) 2026.
@@ -341,7 +341,7 @@ function render() {
       <div class="brand">
         <div class="crest">LG</div>
         <div class="brand-text">
-          <div class="t1">MIFANET RESOURCES</div>
+          <div class="t1">Lagos State Scholarship Board</div>
           <div class="t2">Computer Based Testing Platform</div>
         </div>
       </div>
@@ -353,7 +353,7 @@ function render() {
     </div>
     <main id="mainContent"></main>
     <div class="footer">
-      Developed by <strong>MIFANET RESOURCES</strong> for the MIFANET RESOURCES. Copyright &copy; 2026.
+      Developed by <strong>MIFANET RESOURCES</strong> for the Lagos State Scholarship Board. Copyright &copy; 2026.
     </div>
   `;
   document.getElementById('logoutBtn').onclick = logout;
@@ -373,7 +373,7 @@ function renderLogin() {
     <div class="login-wrap">
       <div class="login-card">
         <div class="login-crest">LG</div>
-        <div class="login-title">MIFANET RESOURCES</div>
+        <div class="login-title">Lagos State Scholarship Board</div>
         <div class="login-sub">Computer Based Testing Platform</div>
         <label>Username</label>
         <input type="text" id="loginUsername" placeholder="Enter your username" />
@@ -1605,6 +1605,35 @@ function escapeHtml(str) {
 function escapeAttr(str) { return escapeHtml(str).replace(/`/g, '&#96;'); }
 
 // ---------- INIT ----------
+// Deterrents against casual source inspection: right-click (view source /
+// inspect) and the common DevTools shortcuts are disabled app-wide.
+// Note: this raises the bar for average candidates but is not absolute —
+// determined users can still open DevTools from the browser menu or before
+// the page loads. Real integrity comes from the server-side controls
+// (answers validated server-side, correct answers never sent to candidates,
+// proctoring recording, and violation logging).
+document.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  if (state.currentView === 'exam' && !state.examSubmitted) {
+    showViolationToast('Right-click is disabled during this exam.');
+  }
+});
+
+document.addEventListener('keydown', (e) => {
+  const key = (e.key || '').toLowerCase();
+  const blocked =
+    e.key === 'F12' ||                                        // DevTools
+    (e.ctrlKey && e.shiftKey && ['i', 'j', 'c'].includes(key)) || // Inspect / Console / Element picker
+    (e.ctrlKey && key === 'u');                               // View source
+  if (blocked) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (state.currentView === 'exam' && !state.examSubmitted) {
+      showViolationToast('Developer tools are disabled during this exam.');
+    }
+  }
+});
+
 window.addEventListener('beforeunload', (e) => {
   if (state.currentView === 'exam' && !state.examSubmitted) {
     e.preventDefault();
