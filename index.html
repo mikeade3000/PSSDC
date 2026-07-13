@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PSSDC - MAGODO — CBT Platform</title>
+<title>Lagos State Scholarship Board — CBT Platform</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
@@ -224,9 +224,10 @@
 
 <script>
 /* ============================================================
-   PSSDC - MAGODO — CBT PLATFORM
+   LAGOS STATE SCHOLARSHIP BOARD — CBT PLATFORM
    Frontend application logic
-   Developed by PSSDC MAGODO for the Lagos State. Copyright (c) 2026.
+   Developed by MIFANET RESOURCES for the Lagos State
+   Scholarship Board. Copyright (c) 2026.
    ============================================================ */
 
 // ---------- CONFIG ----------
@@ -338,9 +339,9 @@ function render() {
   app.innerHTML = `
     <div class="topbar">
       <div class="brand">
-        <div class="crest">PSSDC-MAGODO</div>
+        <div class="crest">LG</div>
         <div class="brand-text">
-          <div class="t1">CBT</div>
+          <div class="t1">Lagos State Scholarship Board</div>
           <div class="t2">Computer Based Testing Platform</div>
         </div>
       </div>
@@ -352,7 +353,7 @@ function render() {
     </div>
     <main id="mainContent"></main>
     <div class="footer">
-      Developed by <strong>PSSDC-MAGODO</strong> for the PSSDC - MAGODO. Copyright &copy; 2026.
+      Developed by <strong>MIFANET RESOURCES</strong> for the Lagos State Scholarship Board. Copyright &copy; 2026.
     </div>
   `;
   document.getElementById('logoutBtn').onclick = logout;
@@ -371,8 +372,8 @@ function renderLogin() {
   return `
     <div class="login-wrap">
       <div class="login-card">
-        <div class="login-crest">CBT</div>
-        <div class="login-title">PSSDC MAGODO</div>
+        <div class="login-crest">LG</div>
+        <div class="login-title">Lagos State Scholarship Board</div>
         <div class="login-sub">Computer Based Testing Platform</div>
         <label>Username</label>
         <input type="text" id="loginUsername" placeholder="Enter your username" />
@@ -569,6 +570,23 @@ function renderAdmin() {
     </div>
 
     <div class="card">
+      <h2>Bulk upload exam allocations</h2>
+      <div class="sub">Allocate many candidates to an exam at once — from a CSV/Notepad text file or an Excel workbook.</div>
+      <div class="bulk-instructions">
+        Columns required, in this order: <code>examId, candidateId</code><br>
+        <code>candidateId</code> may be either the candidate's <code>userId</code> <em>or</em> their <code>username</code> — usernames are matched automatically.<br>
+        Duplicate allocations and unknown exams/candidates are skipped and reported, never failing the whole batch.
+        <br><button class="template-link" id="downloadAssignTemplate">Download template (.csv)</button>
+      </div>
+      <div class="file-row">
+        <input type="file" id="assignBulkFile" accept=".csv,.txt,.xlsx,.xls" />
+        <button class="btn btn-outline btn-sm" id="parseAssignBulkBtn">Parse file</button>
+      </div>
+      <div id="assignBulkPreview"></div>
+      <div id="assignBulkMsg"></div>
+    </div>
+
+    <div class="card">
       <h2>Reallocate exam attempt</h2>
       <div class="sub">Once a candidate submits an exam, they cannot retake it. Use this to clear a completed attempt and allow them to sit the exam again.</div>
       <label>Exam ID</label>
@@ -639,6 +657,41 @@ function attachAdminHandlers() {
     if (!examId || !candidateId) { msg('resetAttemptMsg', 'Both fields are required.', true); return; }
     const r = await apiPost('resetCandidateAttempt', { examId, candidateId });
     msg('resetAttemptMsg', r.success ? r.message : r.error, !r.success);
+  };
+
+  // ---- Bulk exam allocation upload ----
+  document.getElementById('downloadAssignTemplate').onclick = () => {
+    downloadCSV('exam_allocation_template.csv',
+      'examId,candidateId\nexam_abc123,user_bee46895\nexam_abc123,adaeze.okonkwo');
+  };
+
+  document.getElementById('parseAssignBulkBtn').onclick = async () => {
+    const fileInput = document.getElementById('assignBulkFile');
+    const previewEl = document.getElementById('assignBulkPreview');
+    const msgEl = document.getElementById('assignBulkMsg');
+    msgEl.innerHTML = '';
+    if (!fileInput.files.length) { msg('assignBulkMsg', 'Choose a file first.', true); return; }
+    try {
+      const rawRows = await parseUploadedFile(fileInput.files[0]);
+      const { valid, errors } = normalizeAssignmentRows(rawRows);
+      previewEl.innerHTML = renderPreviewTable(
+        ['examId', 'candidateId'], valid, errors,
+        valid.length ? `<button class="btn btn-gold btn-sm" id="confirmAssignBulkBtn">Allocate ${valid.length} candidate(s)</button>` : ''
+      );
+      if (valid.length) {
+        document.getElementById('confirmAssignBulkBtn').onclick = async () => {
+          msg('assignBulkMsg', 'Allocating…', false);
+          const r = await apiPost('assignCandidatesBulk', { assignments: valid });
+          const skippedNote = r.success && r.skipped && r.skipped.length
+            ? ` ${r.skipped.length} skipped: ` + r.skipped.slice(0, 5).map(s => s.reason).join('; ') + (r.skipped.length > 5 ? '; …' : '')
+            : '';
+          msg('assignBulkMsg', r.success ? `${r.created} allocation(s) created.${skippedNote}` : (r.error || 'Allocation failed.'), !r.success);
+          if (r.success) { previewEl.innerHTML = ''; fileInput.value = ''; }
+        };
+      }
+    } catch (e) {
+      msg('assignBulkMsg', 'Could not parse that file: ' + e.message, true);
+    }
   };
 
   // ---- Bulk user upload ----
@@ -791,6 +844,20 @@ function parseCSVText(text) {
   });
 }
 
+function normalizeAssignmentRows(rawRows) {
+  const valid = [], errors = [];
+  rawRows.forEach((row, idx) => {
+    const examId = String(row.examId || '').trim();
+    const candidateId = String(row.candidateId || '').trim();
+    const rowErrors = [];
+    if (!examId) rowErrors.push('missing examId');
+    if (!candidateId) rowErrors.push('missing candidateId');
+    if (rowErrors.length) errors.push({ rowNumber: idx + 2, issues: rowErrors, raw: row });
+    else valid.push({ examId, candidateId });
+  });
+  return { valid, errors };
+}
+
 function normalizeUserRows(rawRows) {
   const valid = [], errors = [];
   const allowedRoles = ['candidate', 'examiner', 'admin'];
@@ -902,9 +969,10 @@ function attachExaminerHandlers() {
     const resultsBody = document.getElementById('monitorResults');
     resultsBody.innerHTML = '<div class="card"><div class="empty-state">Loading…</div></div>';
 
-    const [reportRes, violationsRes] = await Promise.all([
+    const [reportRes, violationsRes, recordingsRes] = await Promise.all([
       apiGet('getExamReport', { examId }),
-      apiGet('getViolations', { examId })
+      apiGet('getViolations', { examId }),
+      apiGet('getExamRecordings', { examId })
     ]);
 
     let html = '<div class="card"><h2>Exam takers</h2>';
@@ -928,6 +996,29 @@ function attachExaminerHandlers() {
       html += '</table>';
     } else {
       html += '<div class="empty-state">No exam takers recorded for this exam yet.</div>';
+    }
+    html += '</div>';
+
+    html += '<div class="card"><h2>Proctoring recordings</h2>';
+    if (recordingsRes.success && recordingsRes.recordings && recordingsRes.recordings.length) {
+      html += `<div class="sub">Each candidate's full session recording, in sequential segments. "Open folder" opens the candidate's recording folder in Google Drive — use Drive's <strong>Download all</strong> button there to download every segment as a single ZIP.</div>`;
+      html += '<table><tr><th>Candidate</th><th>Segments</th><th>Recorded from</th><th>Until</th><th>Download</th></tr>';
+      recordingsRes.recordings.forEach(rec => {
+        const name = rec.fullName ? `${rec.fullName} (${rec.candidateId})` : rec.candidateId;
+        const link = rec.folderUrl
+          ? `<a href="${escapeAttr(rec.folderUrl)}" target="_blank" rel="noopener" class="btn btn-outline btn-sm" style="text-decoration:none;">Open folder</a>`
+          : '<span class="badge badge-warn">folder unavailable</span>';
+        html += `<tr>
+          <td>${escapeHtml(name)}</td>
+          <td>${rec.chunkCount}</td>
+          <td>${rec.firstAt ? new Date(rec.firstAt).toLocaleString() : '—'}</td>
+          <td>${rec.lastAt ? new Date(rec.lastAt).toLocaleString() : '—'}</td>
+          <td>${link}</td>
+        </tr>`;
+      });
+      html += '</table>';
+    } else {
+      html += '<div class="empty-state">No recordings found for this exam yet.</div>';
     }
     html += '</div>';
 
@@ -1351,7 +1442,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v2.3';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v2.4';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
