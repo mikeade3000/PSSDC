@@ -8,6 +8,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js"></script>
 <style>
   :root {
     --navy: #0A3D62;
@@ -192,7 +193,16 @@
   .match-select { margin-top: 4px; }
 
   .side-panel .card { padding: 18px; }
-  .cam-preview { width: 100%; border-radius: 8px; background: #000; aspect-ratio: 4/3; object-fit: cover; }
+  .cam-preview {
+    width: 100%; border-radius: 10px; background: #000; aspect-ratio: 4/3; object-fit: cover;
+    border: 5px solid #0A64C8; box-sizing: border-box;
+    transition: border-color 0.3s, box-shadow 0.3s;
+  }
+  .cam-preview.face-lost {
+    border-color: #E01E1E;
+    box-shadow: 0 0 0 3px rgba(224, 30, 30, 0.35);
+    animation: pulse 1.2s infinite;
+  }
 
   .exam-actions { display: flex; justify-content: space-between; margin-top: 22px; }
 
@@ -257,7 +267,12 @@ const HEARTBEAT_INTERVAL_MS = 45000;
 // decision (accept, review recording, invalidate, allow retake) belongs to the
 // examiner. Technical problems (e.g. recording upload failures) are logged
 // separately and never attributed to candidate conduct.
-const CONDUCT_VIOLATION_TYPES = ['tab_switch', 'fullscreen_exit', 'window_blur', 'left_window_frame'];
+const CONDUCT_VIOLATION_TYPES = ['tab_switch', 'fullscreen_exit', 'window_blur', 'left_window_frame', 'face_out_of_frame'];
+// Face-detection model weights (TinyFaceDetector, ~190KB), fetched once at
+// exam start. If the CDN is unreachable, face monitoring degrades
+// gracefully (blue frame stays, a technical note is logged) — the exam
+// itself is never blocked by it.
+const FACE_MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
 
 // Bootstrap admin credential — lets you into the Admin panel before the
 // Apps Script backend is deployed or before setupSheetsAndFolders has been
@@ -289,6 +304,10 @@ const state = {
   snapshots: {},              // slot key -> JPEG data URL
   geoPosition: null,          // {latitude, longitude, accuracy}
   lastFrameLeaveAt: 0,
+  faceLost: false,
+  faceMisses: 0,
+  faceMonitorHandle: null,
+  faceDetectBusy: false,
   timeRemainingSec: 0,
   timerHandle: null,
   syncHandle: null,
@@ -996,17 +1015,22 @@ function attachExaminerHandlers() {
     if (reportRes.success && reportRes.report && reportRes.report.length) {
       html += `<div class="sub">"Suggested action" is advisory, based on the count of conduct flags — the decision on every sitting is yours. Technical issues (e.g. recording upload problems) are the platform's responsibility, not the candidate's, and carry no suggested action.</div>`;
       html += '<button class="btn btn-gold btn-sm" id="downloadReportBtn" style="margin-bottom:14px;">Download all exam takers (CSV)</button>';
-      html += '<table><tr><th>Candidate</th><th>Status</th><th>Score</th><th>Answered</th><th>Conduct flags</th><th>Technical issues</th><th>Suggested action</th></tr>';
+      html += '<table><tr><th>Candidate</th><th>Status</th><th>Score</th><th>%</th><th>Answered</th><th>Conduct flags</th><th>Technical issues</th><th>Location</th><th>Suggested action</th></tr>';
       reportRes.report.forEach(r => {
         const rec = recommendedAction(Number(r.conductViolations) || 0);
         const name = r.fullName ? `${r.fullName} (${r.candidateId})` : r.candidateId;
+        const loc = r.locationName
+          ? r.locationName
+          : (r.latitude !== '' && r.latitude !== undefined && r.latitude !== null && r.longitude !== '' ? `${r.latitude}, ${r.longitude}` : '—');
         html += `<tr>
           <td>${escapeHtml(name)}</td>
           <td><span class="badge ${r.status === 'submitted' ? 'badge-ok' : (r.status === 'in_progress' ? 'badge-warn' : 'badge-danger')}">${escapeHtml(r.status)}</span></td>
           <td>${r.score} / ${r.maxScore}</td>
+          <td>${r.percentScore !== '' && r.percentScore !== undefined ? r.percentScore + '%' : '—'}</td>
           <td>${r.answered}</td>
           <td>${r.conductViolations}</td>
           <td>${r.technicalIssues}</td>
+          <td>${escapeHtml(String(loc))}</td>
           <td><span class="badge ${rec.cls}">${escapeHtml(rec.label)}</span></td>
         </tr>`;
       });
@@ -1053,14 +1077,15 @@ function attachExaminerHandlers() {
     if (dlBtn) {
       dlBtn.onclick = () => {
         const qLabels = (reportRes.questionKey || []).map(k => k.label);
-        const header = ['candidateId', 'fullName', 'username', 'status', 'startedAt', 'score', 'maxScore', 'answered', 'conductViolations', 'technicalIssues', 'suggestedAction'].concat(qLabels);
+        const header = ['candidateId', 'fullName', 'username', 'status', 'startedAt', 'endedAt', 'score', 'maxScore', 'percentScore', 'answered', 'conductViolations', 'technicalIssues', 'suggestedAction', 'latitude', 'longitude', 'locationName'].concat(qLabels);
         const lines = [header.join(',')];
         reportRes.report.forEach(r => {
           const rec = recommendedAction(Number(r.conductViolations) || 0);
           const perQ = qLabels.map(l => (r.perQuestion && r.perQuestion[l] !== undefined) ? r.perQuestion[l] : '');
           lines.push([
-            r.candidateId, r.fullName, r.username, r.status, r.startedAt,
-            r.score, r.maxScore, r.answered, r.conductViolations, r.technicalIssues, rec.label
+            r.candidateId, r.fullName, r.username, r.status, r.startedAt, r.endedAt,
+            r.score, r.maxScore, r.percentScore, r.answered, r.conductViolations, r.technicalIssues, rec.label,
+            r.latitude, r.longitude, r.locationName
           ].concat(perQ).map(csvEscape).join(','));
         });
         downloadCSV(`exam_report_${examId}.csv`, lines.join('\n'));
@@ -1396,6 +1421,7 @@ function beginExam() {
   startAnswerSync();
   startHeartbeat();
   attachProctoringListeners();
+  startFaceMonitor();
 }
 
 function renderExam() {
@@ -1430,7 +1456,7 @@ function renderExam() {
       </div>
       <div class="side-panel">
         <div class="card">
-          <video id="camPreview" class="cam-preview" autoplay muted playsinline></video>
+          <video id="camPreview" class="cam-preview${state.faceLost ? ' face-lost' : ''}" autoplay muted playsinline></video>
           <div class="sub" style="margin-top:10px;">Your camera and microphone are being recorded for the full duration of this exam.</div>
         </div>
       </div>
@@ -1656,7 +1682,7 @@ function setRecordingHealth(status) {
 // through the exact same pipeline real exam chunks use. Returns {ok, reason}.
 // This proves camera capture, encoding, base64 transport, Apps Script, and
 // Drive write all work end-to-end before the exam is allowed to begin.
-const REQUIRED_BACKEND_VERSION_PREFIX = 'v2.6';
+const REQUIRED_BACKEND_VERSION_PREFIX = 'v2.7';
 
 async function runRecordingPreflight() {
   // Step 1: confirm the LIVE backend is running current code. A stale
@@ -1908,6 +1934,60 @@ function stopAllTimers() {
   if (state.timerHandle) clearInterval(state.timerHandle);
   if (state.syncHandle) clearInterval(state.syncHandle);
   if (state.heartbeatHandle) clearInterval(state.heartbeatHandle);
+  if (state.faceMonitorHandle) clearInterval(state.faceMonitorHandle);
+}
+
+// ---------- FACE-IN-FRAME MONITOR ----------
+// Checks every 3 seconds whether a face is present in the camera preview.
+// Present: thick BLUE frame. Absent for two consecutive checks: frame turns
+// RED and a 'face_out_of_frame' conduct violation is logged once per
+// departure (a fresh flag requires the face to return first).
+async function startFaceMonitor() {
+  if (typeof faceapi === 'undefined') {
+    apiPost('logViolation', {
+      examId: state.exam.examId, candidateId: state.user.userId,
+      type: 'face_monitor_unavailable', detail: 'Face-detection library did not load; face-in-frame monitoring inactive for this sitting.'
+    }).catch(() => {});
+    return;
+  }
+  try {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+  } catch (e) {
+    apiPost('logViolation', {
+      examId: state.exam.examId, candidateId: state.user.userId,
+      type: 'face_monitor_unavailable', detail: 'Face-detection model could not be loaded (' + e.message + '); face-in-frame monitoring inactive for this sitting.'
+    }).catch(() => {});
+    return;
+  }
+
+  state.faceLost = false;
+  state.faceMisses = 0;
+  state.faceMonitorHandle = setInterval(async () => {
+    if (state.examSubmitted || state.faceDetectBusy) return;
+    const videoEl = document.getElementById('camPreview');
+    if (!videoEl || !videoEl.videoWidth) return;
+    state.faceDetectBusy = true;
+    try {
+      const detection = await faceapi.detectSingleFace(
+        videoEl, new faceapi.TinyFaceDetectorOptions({ inputSize: 160, scoreThreshold: 0.4 })
+      );
+      if (detection) {
+        state.faceMisses = 0;
+        if (state.faceLost) {
+          state.faceLost = false;
+          videoEl.classList.remove('face-lost');
+        }
+      } else {
+        state.faceMisses++;
+        if (state.faceMisses >= 2 && !state.faceLost) {
+          state.faceLost = true;
+          videoEl.classList.add('face-lost');
+          recordViolation('face_out_of_frame', 'Candidate\'s face left the camera frame.');
+        }
+      }
+    } catch (e) { /* transient detection error — try again next tick */ }
+    state.faceDetectBusy = false;
+  }, 3000);
 }
 
 function renderSubmitted() {
