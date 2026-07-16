@@ -8,7 +8,6 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/face-api.js/0.22.2/face-api.min.js"></script>
 <style>
   :root {
     --navy: #0A3D62;
@@ -268,11 +267,25 @@ const HEARTBEAT_INTERVAL_MS = 45000;
 // examiner. Technical problems (e.g. recording upload failures) are logged
 // separately and never attributed to candidate conduct.
 const CONDUCT_VIOLATION_TYPES = ['tab_switch', 'fullscreen_exit', 'window_blur', 'left_window_frame', 'face_out_of_frame'];
-// Face-detection model weights (TinyFaceDetector, ~190KB), fetched once at
-// exam start. If the CDN is unreachable, face monitoring degrades
-// gracefully (blue frame stays, a technical note is logged) — the exam
-// itself is never blocked by it.
-const FACE_MODEL_URL = 'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights';
+// Face detection: library + TinyFaceDetector weights (~190KB), each tried
+// across several independent sources so one CDN being down, blocked, or
+// filtered on a candidate's network cannot disable monitoring.
+// NOTE: cdnjs does NOT host face-api.js — do not add it here.
+// The npm package ships dist/face-api.min.js but NO weights, so the model
+// must come from the GitHub repo (raw.githubusercontent sends
+// access-control-allow-origin: *, so it works cross-origin).
+const FACE_LIB_URLS = [
+  'https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js',
+  'https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js'
+];
+const FACE_MODEL_URLS = [
+  'https://cdn.jsdelivr.net/gh/justadudewhohacks/face-api.js@0.22.2/weights',
+  'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/0.22.2/weights',
+  'https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights'
+];
+let faceApiReadyPromise = null;
+let faceLibSource = '';
+let faceModelSource = '';
 
 // Bootstrap admin credential — lets you into the Admin panel before the
 // Apps Script backend is deployed or before setupSheetsAndFolders has been
@@ -1515,6 +1528,10 @@ function attachGateHandlers() {
 
       state.snapshots = {};
       state.gateStep = 'snapshots';
+      // Warm the face-detection library/model now, while the candidate is
+      // taking their snapshots, so monitoring is live the instant the exam
+      // starts. Failures are handled later by startFaceMonitor.
+      ensureFaceApiReady().catch(() => {});
       render();
     } catch (e) {
       errEl.innerHTML = `<div class="error-msg">Camera/microphone access was denied or unavailable. You must grant access to begin the exam. (${escapeHtml(e.message)})</div>`;
@@ -2189,24 +2206,74 @@ function stopAllTimers() {
 }
 
 // ---------- FACE-IN-FRAME MONITOR ----------
+// Loads a script, resolving only once it has actually executed.
+function loadExternalScript(src, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('timed out'));
+    }, timeoutMs || 20000);
+    s.src = src;
+    s.async = true;
+    s.onload = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+    s.onerror = () => { if (settled) return; settled = true; clearTimeout(timer); reject(new Error('not reachable')); };
+    document.head.appendChild(s);
+  });
+}
+
+// Loads the face-detection library and model, trying each source in turn.
+// Memoised: callers share one attempt. Warmed early (while the candidate is
+// taking snapshots) so detection is ready the moment the exam begins.
+function ensureFaceApiReady() {
+  if (faceApiReadyPromise) return faceApiReadyPromise;
+  faceApiReadyPromise = (async () => {
+    if (typeof faceapi === 'undefined') {
+      const errs = [];
+      for (let i = 0; i < FACE_LIB_URLS.length; i++) {
+        try {
+          await loadExternalScript(FACE_LIB_URLS[i]);
+          if (typeof faceapi !== 'undefined') { faceLibSource = FACE_LIB_URLS[i]; break; }
+          errs.push(FACE_LIB_URLS[i] + ' (loaded but did not define faceapi)');
+        } catch (e) {
+          errs.push(FACE_LIB_URLS[i] + ' (' + e.message + ')');
+        }
+      }
+      if (typeof faceapi === 'undefined') {
+        throw new Error('Face-detection library could not be loaded from any source — ' + errs.join('; '));
+      }
+    }
+    const modelErrs = [];
+    for (let i = 0; i < FACE_MODEL_URLS.length; i++) {
+      try {
+        await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URLS[i]);
+        faceModelSource = FACE_MODEL_URLS[i];
+        return true;
+      } catch (e) {
+        modelErrs.push(FACE_MODEL_URLS[i] + ' (' + (e.message || e) + ')');
+      }
+    }
+    throw new Error('Face-detection model could not be loaded from any source — ' + modelErrs.join('; '));
+  })();
+  return faceApiReadyPromise;
+}
+
 // Checks every 3 seconds whether a face is present in the camera preview.
 // Present: thick BLUE frame. Absent for two consecutive checks: frame turns
 // RED and a 'face_out_of_frame' conduct violation is logged once per
 // departure (a fresh flag requires the face to return first).
 async function startFaceMonitor() {
-  if (typeof faceapi === 'undefined') {
-    apiPost('logViolation', {
-      examId: state.exam.examId, candidateId: state.user.userId,
-      type: 'face_monitor_unavailable', detail: 'Face-detection library did not load; face-in-frame monitoring inactive for this sitting.'
-    }).catch(() => {});
-    return;
-  }
   try {
-    await faceapi.nets.tinyFaceDetector.loadFromUri(FACE_MODEL_URL);
+    await ensureFaceApiReady();
+    audit('face_monitor_ready', 'Face monitoring active (library: ' + faceLibSource + ', model: ' + faceModelSource + ')', state.exam.examId);
   } catch (e) {
+    // Deliberate: a monitoring outage never blocks a candidate's exam. The
+    // failure is logged with the exact sources tried so it can be fixed.
     apiPost('logViolation', {
       examId: state.exam.examId, candidateId: state.user.userId,
-      type: 'face_monitor_unavailable', detail: 'Face-detection model could not be loaded (' + e.message + '); face-in-frame monitoring inactive for this sitting.'
+      type: 'face_monitor_unavailable', detail: e.message
     }).catch(() => {});
     return;
   }
